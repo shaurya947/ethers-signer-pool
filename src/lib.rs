@@ -113,8 +113,6 @@ async fn handle_new_tx_with_oneshot(
     >,
     bcast_resp_sender: &mpsc::Sender<BroadcastResponse>,
 ) {
-    use SignerState::*;
-
     let tx_with_internal_nonce = TXWithInternalNonce {
         function_call: tx_with_oneshot.function_call,
         internal_nonce,
@@ -128,31 +126,12 @@ async fn handle_new_tx_with_oneshot(
     let good_signer = get_good_signer(signers, signer_states, estimated_gas_cost);
 
     if let Some(signer) = good_signer {
-        match signer_states.get(&signer.address()).unwrap() {
-            Idle { balance } => {
-                *signer_states.get_mut(&signer.address()).unwrap() = Busy {
-                    balance: *balance,
-                    estimated_pending_spend: estimated_gas_cost,
-                    nonces_and_est_costs: HashMap::from([(
-                        tx_with_internal_nonce.internal_nonce,
-                        estimated_gas_cost,
-                    )]),
-                };
-            }
-            Busy { .. } => {
-                let state = signer_states.get_mut(&signer.address()).unwrap();
-                if let Busy {
-                    estimated_pending_spend,
-                    nonces_and_est_costs,
-                    ..
-                } = state
-                {
-                    *estimated_pending_spend += estimated_gas_cost;
-                    nonces_and_est_costs
-                        .insert(tx_with_internal_nonce.internal_nonce, estimated_gas_cost);
-                }
-            }
-        }
+        let state = signer_states.remove(&signer.address()).unwrap();
+        signer_states.insert(
+            signer.address(),
+            state.add_to_pending_spend(estimated_gas_cost, internal_nonce),
+        );
+
         let signer = Arc::clone(signer);
         let bcast_resp_sender = bcast_resp_sender.clone();
         task::spawn(send_transaction(
@@ -209,34 +188,23 @@ async fn handle_broadcast_response(
         oneshot::Sender<eyre::Result<Option<TransactionReceipt>>>,
     >,
 ) {
-    use SignerState::*;
+    let BroadcastResponse {
+        signer_address,
+        broadcast_result,
+        internal_nonce,
+        new_signer_balance,
+    } = bcast_resp;
+
     let _ = oneshot_responder_map
-        .remove(&bcast_resp.internal_nonce)
+        .remove(&internal_nonce)
         .unwrap()
-        .send(bcast_resp.broadcast_result);
+        .send(broadcast_result);
 
-    match signer_states.get(&bcast_resp.signer_address).unwrap() {
-        Busy { .. } => {
-            let state = signer_states.get_mut(&bcast_resp.signer_address).unwrap();
-            if let Busy {
-                balance,
-                estimated_pending_spend,
-                nonces_and_est_costs,
-            } = state
-            {
-                *balance = bcast_resp.new_signer_balance;
-                let pending_spend_to_remove = nonces_and_est_costs
-                    .remove(&bcast_resp.internal_nonce)
-                    .unwrap();
-                *estimated_pending_spend -= pending_spend_to_remove;
-
-                if nonces_and_est_costs.is_empty() {
-                    *state = Idle { balance: *balance }
-                }
-            }
-        }
-        _ => panic!("State must have been busy"),
-    }
+    let state = signer_states.remove(&signer_address).unwrap();
+    signer_states.insert(
+        signer_address,
+        state.remove_from_pending_spend(new_signer_balance, internal_nonce),
+    );
 }
 
 async fn estimate_gas_cost(
@@ -315,6 +283,53 @@ enum SignerState {
         estimated_pending_spend: U256,
         nonces_and_est_costs: HashMap<U256, U256>,
     },
+}
+
+impl SignerState {
+    fn add_to_pending_spend(mut self, estimated_gas_cost: U256, internal_nonce: U256) -> Self {
+        use SignerState::*;
+
+        match &mut self {
+            Idle { balance } => Busy {
+                balance: *balance,
+                estimated_pending_spend: estimated_gas_cost,
+                nonces_and_est_costs: HashMap::from([(internal_nonce, estimated_gas_cost)]),
+            },
+            Busy {
+                estimated_pending_spend,
+                nonces_and_est_costs,
+                ..
+            } => {
+                *estimated_pending_spend += estimated_gas_cost;
+                nonces_and_est_costs.insert(internal_nonce, estimated_gas_cost);
+                self
+            }
+        }
+    }
+
+    fn remove_from_pending_spend(mut self, new_balance: U256, internal_nonce: U256) -> Self {
+        use SignerState::*;
+
+        match &mut self {
+            Idle { .. } => panic!("Invalid signer state"),
+            Busy {
+                balance,
+                estimated_pending_spend,
+                nonces_and_est_costs,
+            } => {
+                *estimated_pending_spend -= nonces_and_est_costs.remove(&internal_nonce).unwrap();
+                *balance = new_balance;
+
+                if nonces_and_est_costs.is_empty() {
+                    Idle {
+                        balance: new_balance,
+                    }
+                } else {
+                    self
+                }
+            }
+        }
+    }
 }
 
 // pub fn add(left: usize, right: usize) -> usize {
