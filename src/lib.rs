@@ -1,10 +1,9 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, panic, sync::Arc};
 
 use ethers::prelude::{k256::ecdsa::SigningKey, *};
 use tokio::{
-    sync::{mpsc, oneshot, RwLock},
+    sync::{mpsc, oneshot},
     task,
-    time::{self, Instant},
 };
 
 pub struct SignerPool {
@@ -14,21 +13,22 @@ pub struct SignerPool {
 impl SignerPool {
     pub fn new(provider: Arc<Provider<Http>>, signing_keys: Vec<Wallet<SigningKey>>) -> SignerPool {
         // TODO make buffer capacity configurable
-        // TODO allow caller to specify optional gas cost estimation function
         let (tx_sender, tx_receiver) = mpsc::channel(100);
-        task::spawn(Self::scheduler_task(provider, signing_keys, tx_receiver));
+        task::spawn(dispatcher_task(provider, signing_keys, tx_receiver));
         SignerPool { tx_sender }
     }
 
     pub async fn send_transactions(
         &self,
         function_calls: Vec<FunctionCall<Arc<Provider<Http>>, Provider<Http>, ()>>,
-    ) -> Vec<eyre::Result<TransactionReceipt>> {
+    ) -> Vec<eyre::Result<Option<TransactionReceipt>>> {
         // TODO allow caller to specify optional gas fetching function
+        // TODO allow caller to specify optional gas cost estimation function
         let mut oneshot_receivers = vec![];
         for function_call in function_calls {
             let (oneshot_sender, oneshot_receiver) = oneshot::channel();
             // TODO error handling
+            // TODO could consider sending full vec as batch
             self.tx_sender
                 .send(TXWithOneshot {
                     function_call,
@@ -47,194 +47,223 @@ impl SignerPool {
         }
         results
     }
+}
 
-    async fn scheduler_task(
-        provider: Arc<Provider<Http>>,
-        signing_keys: Vec<Wallet<SigningKey>>,
-        mut tx_receiver: mpsc::Receiver<TXWithOneshot>,
-    ) {
-        use SignerState::*;
+async fn dispatcher_task(
+    provider: Arc<Provider<Http>>,
+    signing_keys: Vec<Wallet<SigningKey>>,
+    mut tx_receiver: mpsc::Receiver<TXWithOneshot>,
+) {
+    use SignerState::*;
 
-        let mut signer_workers = vec![];
-        for k in signing_keys {
-            let (tx_sender, tx_receiver) = mpsc::channel(10);
-            // TODO error handling
-            let signer_current_balance = provider.get_balance(k.address(), None).await.unwrap();
-            let signer_state = Arc::new(RwLock::new(Idle {
-                balance: signer_current_balance,
-            }));
-            let signer = Arc::new(SignerMiddleware::new(Arc::clone(&provider), k));
-            let signer_worker = SignerWorker {
-                signer: Arc::clone(&signer),
-                state: Arc::clone(&signer_state),
-                tx_sender,
-            };
-            task::spawn(Self::signer_worker_task(signer, signer_state, tx_receiver));
-            signer_workers.push(signer_worker);
-        }
+    let mut signers = vec![];
+    let mut signer_states = HashMap::new();
+    for k in signing_keys {
+        // TODO error handling
+        let balance = provider.get_balance(k.address(), None).await.unwrap();
+        signer_states.insert(k.address(), Idle { balance });
+        signers.push(Arc::new(SignerMiddleware::new(Arc::clone(&provider), k)));
+    }
 
-        'outer: while let Some(tx_with_oneshot) = tx_receiver.recv().await {
-            use SignerState::*;
-            let estimated_gas_cost =
-                Self::estimate_gas_cost(&provider, &tx_with_oneshot.function_call)
+    // TODO think about this bound
+    let (bcast_resp_sender, mut bcast_resp_receiver) = mpsc::channel(100);
+    let mut internal_nonce = U256::zero();
+    let mut oneshot_responder_map = HashMap::new();
+
+    'outer: loop {
+        tokio::select! {
+            tx_with_oneshot = tx_receiver.recv() => {
+                if tx_with_oneshot.is_none() {
+                    break 'outer;
+                }
+                let tx_with_oneshot = tx_with_oneshot.unwrap();
+
+                let tx_with_internal_nonce = TXWithInternalNonce {
+                    function_call: tx_with_oneshot.function_call,
+                    internal_nonce,
+                };
+                oneshot_responder_map.insert(internal_nonce, tx_with_oneshot.oneshot_sender);
+                internal_nonce += U256::one();
+
+                // TODO if gas cost estimation fails, just return error in oneshot here
+                let estimated_gas_cost =
+                    estimate_gas_cost(&provider, &tx_with_internal_nonce.function_call)
                     .await
                     .unwrap();
-            // TODO if gas cost estimation fails, just return error in oneshot here
 
-            // try to find an idle signer that can handle this TX
-            for sw in signer_workers.iter() {
-                if let Idle { balance } = *sw.state.read().await {
-                    if balance >= estimated_gas_cost {
-                        {
-                            let mut state_write = sw.state.write().await;
-                            *state_write = Busy {
-                                predicted_next_balance: balance - estimated_gas_cost,
-                            }
-                        }
-                        // TODO handle error
-                        let _ = sw.tx_sender.send(tx_with_oneshot).await;
-                        continue 'outer;
-                    }
-                }
-            }
-
-            // if no idle signer found, try to find a busy signer
-            for sw in signer_workers.iter() {
-                if let Busy {
-                    predicted_next_balance,
-                } = *sw.state.read().await
-                {
-                    if predicted_next_balance >= estimated_gas_cost {
-                        {
-                            let mut state_write = sw.state.write().await;
-                            *state_write = Busy {
-                                predicted_next_balance: predicted_next_balance - estimated_gas_cost,
-                            }
-                        }
-                        // TODO handle error
-                        let _ = sw.tx_sender.send(tx_with_oneshot).await;
-                        continue 'outer;
-                    }
-                }
-            }
-
-            // TODO if no idle OR busy signer found, return error in oneshot
-            // TODO could consider retrying above two loops 2-3 times before giving up
-        }
-    }
-
-    async fn estimate_gas_cost(
-        provider: &Provider<Http>,
-        function_call: &FunctionCall<Arc<Provider<Http>>, Provider<Http>, ()>,
-    ) -> eyre::Result<U256> {
-        // TODO custom errors + gas scaling (configurable?)
-        let gas_price = provider.get_gas_price().await?;
-        let gas_units = function_call.estimate_gas().await?;
-        Ok(gas_price * gas_units)
-    }
-
-    async fn signer_worker_task(
-        signer: Arc<SignerMiddleware<Arc<Provider<Http>>, Wallet<SigningKey>>>,
-        state: Arc<RwLock<SignerState>>,
-        mut tx_receiver: mpsc::Receiver<TXWithOneshot>,
-    ) {
-        // TODO make balance refresh interval configurable
-        let balance_refresh_interval = Duration::from_secs(30);
-        let mut balance_refresh_timer = time::interval_at(
-            Instant::now() + balance_refresh_interval,
-            balance_refresh_interval,
-        );
-
-        loop {
-            tokio::select! {
-                _ = balance_refresh_timer.tick() => {
-                    Self::refresh_signer_balance(&signer, &state).await;
-                },
-                tx_with_oneshot = tx_receiver.recv() => {
-                    if let Some(tx_with_oneshot) = tx_with_oneshot {
-                        Self::receive_tx_with_oneshot(tx_with_oneshot, &signer, &state).await;
+                // try idle signers first
+                let mut good_signer = signers.iter().find(|s| {
+                    if let Some(Idle { balance }) = signer_states.get(&s.address()) {
+                        *balance >= estimated_gas_cost
                     } else {
-                        break;
+                        false
                     }
+                });
+
+                // if no idle signer worked, try busy signers
+                if good_signer.is_none() {
+                    good_signer = signers.iter().find(|s| {
+                        if let Some(Busy {
+                            balance,
+                            estimated_pending_spend,
+                            ..
+                        }) = signer_states.get(&s.address())
+                        {
+                            *balance - *estimated_pending_spend >= estimated_gas_cost
+                        } else {
+                            false
+                        }
+                    });
+                }
+
+                if let Some(signer) = good_signer {
+                    match signer_states.get(&signer.address()).unwrap() {
+                        Idle { balance } => {
+                            *signer_states.get_mut(&signer.address()).unwrap() = Busy {
+                                balance: *balance,
+                                estimated_pending_spend: estimated_gas_cost,
+                                nonces_and_est_costs: HashMap::from([(
+                                    tx_with_internal_nonce.internal_nonce,
+                                    estimated_gas_cost,
+                                )]),
+                            };
+                        }
+                        Busy { .. } => {
+                            let state = signer_states.get_mut(&signer.address()).unwrap();
+                            if let Busy {
+                                estimated_pending_spend,
+                                nonces_and_est_costs,
+                                ..
+                            } = state
+                            {
+                                *estimated_pending_spend += estimated_gas_cost;
+                                nonces_and_est_costs
+                                    .insert(tx_with_internal_nonce.internal_nonce, estimated_gas_cost);
+                            }
+                        }
+                    }
+                    let signer = Arc::clone(signer);
+                    let bcast_resp_sender = bcast_resp_sender.clone();
+                    task::spawn(send_transaction(
+                        signer,
+                        bcast_resp_sender,
+                        tx_with_internal_nonce,
+                    ));
+                } else {
+                    // TODO return error in oneshot here
+                    // TODO could consider retrying above two loops 2-3 times before giving up
+                }
+            },
+            bcast_resp = bcast_resp_receiver.recv() => {
+                let bcast_resp = bcast_resp.unwrap();
+                let _ = oneshot_responder_map
+                    .remove(&bcast_resp.internal_nonce)
+                    .unwrap()
+                    .send(bcast_resp.broadcast_result);
+
+                match signer_states.get(&bcast_resp.signer_address).unwrap() {
+                    Busy { .. } => {
+                        let state = signer_states.get_mut(&bcast_resp.signer_address).unwrap();
+                        if let Busy {
+                            balance,
+                            estimated_pending_spend,
+                            nonces_and_est_costs,
+                        } = state
+                        {
+                            *balance = bcast_resp.new_signer_balance;
+                            let pending_spend_to_remove = nonces_and_est_costs
+                                .remove(&bcast_resp.internal_nonce)
+                                .unwrap();
+                            *estimated_pending_spend -= pending_spend_to_remove;
+
+                            if nonces_and_est_costs.is_empty() {
+                                *state = Idle { balance: *balance }
+                            }
+                        }
+                    }
+                    _ => panic!("State must have been busy"),
                 }
             }
         }
     }
+}
 
-    async fn refresh_signer_balance(
-        signer: &Arc<SignerMiddleware<Arc<Provider<Http>>, Wallet<SigningKey>>>,
-        state: &Arc<RwLock<SignerState>>,
-    ) {
-        use SignerState::*;
-        if let Idle { balance: _ } = *state.read().await {
-            let mut state_write = state.write().await;
-            // TODO error handling
-            let new_balance = signer.get_balance(signer.address(), None).await.unwrap();
-            *state_write = Idle {
-                balance: new_balance,
-            };
-        }
-    }
+async fn estimate_gas_cost(
+    provider: &Provider<Http>,
+    function_call: &FunctionCall<Arc<Provider<Http>>, Provider<Http>, ()>,
+) -> eyre::Result<U256> {
+    // TODO custom errors + gas scaling (configurable?)
+    let gas_price = provider.get_gas_price().await?;
+    let gas_units = function_call.estimate_gas().await?;
+    Ok(gas_price * gas_units)
+}
 
-    async fn receive_tx_with_oneshot(
-        tx_with_oneshot: TXWithOneshot,
-        signer: &Arc<SignerMiddleware<Arc<Provider<Http>>, Wallet<SigningKey>>>,
-        state: &Arc<RwLock<SignerState>>,
-    ) {
-        let res = Self::send_transaction(&tx_with_oneshot.function_call, signer).await;
-        // TODO is it ok to ignore oneshot send error?
-        let _ = tx_with_oneshot.oneshot_sender.send(res);
-        Self::reset_signer_state(signer, state).await;
-    }
+async fn send_transaction(
+    signer: Arc<SignerMiddleware<Arc<Provider<Http>>, Wallet<SigningKey>>>,
+    bcast_resp_sender: mpsc::Sender<BroadcastResponse>,
+    tx_with_internal_nonce: TXWithInternalNonce,
+) {
+    let mut tx = tx_with_internal_nonce.function_call.tx.clone();
+    // TODO custom errors + gas scaling (configurable?)
+    tx.set_gas_price(signer.get_gas_price().await.unwrap());
+    tx.set_gas(
+        tx_with_internal_nonce
+            .function_call
+            .estimate_gas()
+            .await
+            .unwrap(),
+    );
 
-    async fn send_transaction(
-        function_call: &FunctionCall<Arc<Provider<Http>>, Provider<Http>, ()>,
-        signer: &Arc<SignerMiddleware<Arc<Provider<Http>>, Wallet<SigningKey>>>,
-    ) -> eyre::Result<TransactionReceipt> {
-        let mut tx = function_call.tx.clone();
-        // TODO custom errors + gas scaling (configurable?)
-        tx.set_gas_price(signer.get_gas_price().await?);
-        tx.set_gas(function_call.estimate_gas().await?);
+    // TODO custom errors
+    let broadcast_result = signer
+        .send_transaction(tx, None)
+        .await
+        .unwrap()
+        .await
+        .map_err(|_| eyre::eyre!("Oops")); // TODO find way to remove this
 
-        let receipt = signer
-            .send_transaction(tx, None)
-            .await?
-            .await?
-            .ok_or(eyre::eyre!("Transaction confirmed but receipt absent"))?;
-
-        Ok(receipt)
-    }
-
-    async fn reset_signer_state(
-        signer: &Arc<SignerMiddleware<Arc<Provider<Http>>, Wallet<SigningKey>>>,
-        state: &Arc<RwLock<SignerState>>,
-    ) {
-        use SignerState::*;
-        let mut state_write = state.write().await;
-        // TODO error handling
-        let new_balance = signer.get_balance(signer.address(), None).await.unwrap();
-        *state_write = Idle {
-            balance: new_balance,
-        };
-    }
+    // TODO ok to ignore?
+    let _ = bcast_resp_sender
+        .send(BroadcastResponse {
+            broadcast_result,
+            internal_nonce: tx_with_internal_nonce.internal_nonce,
+            // TODO error handling here (or ignore with option?)
+            new_signer_balance: signer.get_balance(signer.address(), None).await.unwrap(),
+            signer_address: signer.address(),
+        })
+        .await;
 }
 
 struct TXWithOneshot {
     // TODO see if we can get away with borrowing function_call
     function_call: FunctionCall<Arc<Provider<Http>>, Provider<Http>, ()>,
     // TODO custom error messages for different kinds of failures
-    oneshot_sender: oneshot::Sender<eyre::Result<TransactionReceipt>>,
+    oneshot_sender: oneshot::Sender<eyre::Result<Option<TransactionReceipt>>>,
+}
+
+struct TXWithInternalNonce {
+    // TODO see if we can get away with borrowing function_call
+    function_call: FunctionCall<Arc<Provider<Http>>, Provider<Http>, ()>,
+    internal_nonce: U256,
+}
+
+struct BroadcastResponse {
+    // TODO custom error messages for different kinds of failures
+    broadcast_result: eyre::Result<Option<TransactionReceipt>>,
+    internal_nonce: U256,
+    new_signer_balance: U256,
+    signer_address: H160,
 }
 
 enum SignerState {
-    Idle { balance: U256 },
-    Busy { predicted_next_balance: U256 },
-}
-
-struct SignerWorker {
-    signer: Arc<SignerMiddleware<Arc<Provider<Http>>, Wallet<SigningKey>>>,
-    state: Arc<RwLock<SignerState>>,
-    tx_sender: mpsc::Sender<TXWithOneshot>,
+    Idle {
+        balance: U256,
+    },
+    Busy {
+        balance: U256,
+        estimated_pending_spend: U256,
+        nonces_and_est_costs: HashMap<U256, U256>,
+    },
 }
 
 // pub fn add(left: usize, right: usize) -> usize {
