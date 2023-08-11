@@ -54,14 +54,12 @@ async fn dispatcher_task(
     signing_keys: Vec<Wallet<SigningKey>>,
     mut tx_receiver: mpsc::Receiver<TXWithOneshot>,
 ) {
-    use SignerState::*;
-
     let mut signers = vec![];
     let mut signer_states = HashMap::new();
     for k in signing_keys {
         // TODO error handling
         let balance = provider.get_balance(k.address(), None).await.unwrap();
-        signer_states.insert(k.address(), Idle { balance });
+        signer_states.insert(k.address(), SignerState::Idle { balance });
         signers.push(Arc::new(SignerMiddleware::new(Arc::clone(&provider), k)));
     }
 
@@ -77,114 +75,156 @@ async fn dispatcher_task(
                     break 'outer;
                 }
                 let tx_with_oneshot = tx_with_oneshot.unwrap();
-
-                let tx_with_internal_nonce = TXWithInternalNonce {
-                    function_call: tx_with_oneshot.function_call,
-                    internal_nonce,
-                };
-                oneshot_responder_map.insert(internal_nonce, tx_with_oneshot.oneshot_sender);
                 internal_nonce += U256::one();
 
-                // TODO if gas cost estimation fails, just return error in oneshot here
-                let estimated_gas_cost =
-                    estimate_gas_cost(&provider, &tx_with_internal_nonce.function_call)
-                    .await
-                    .unwrap();
-
-                // try idle signers first
-                let mut good_signer = signers.iter().find(|s| {
-                    if let Some(Idle { balance }) = signer_states.get(&s.address()) {
-                        *balance >= estimated_gas_cost
-                    } else {
-                        false
-                    }
-                });
-
-                // if no idle signer worked, try busy signers
-                if good_signer.is_none() {
-                    good_signer = signers.iter().find(|s| {
-                        if let Some(Busy {
-                            balance,
-                            estimated_pending_spend,
-                            ..
-                        }) = signer_states.get(&s.address())
-                        {
-                            *balance - *estimated_pending_spend >= estimated_gas_cost
-                        } else {
-                            false
-                        }
-                    });
-                }
-
-                if let Some(signer) = good_signer {
-                    match signer_states.get(&signer.address()).unwrap() {
-                        Idle { balance } => {
-                            *signer_states.get_mut(&signer.address()).unwrap() = Busy {
-                                balance: *balance,
-                                estimated_pending_spend: estimated_gas_cost,
-                                nonces_and_est_costs: HashMap::from([(
-                                    tx_with_internal_nonce.internal_nonce,
-                                    estimated_gas_cost,
-                                )]),
-                            };
-                        }
-                        Busy { .. } => {
-                            let state = signer_states.get_mut(&signer.address()).unwrap();
-                            if let Busy {
-                                estimated_pending_spend,
-                                nonces_and_est_costs,
-                                ..
-                            } = state
-                            {
-                                *estimated_pending_spend += estimated_gas_cost;
-                                nonces_and_est_costs
-                                    .insert(tx_with_internal_nonce.internal_nonce, estimated_gas_cost);
-                            }
-                        }
-                    }
-                    let signer = Arc::clone(signer);
-                    let bcast_resp_sender = bcast_resp_sender.clone();
-                    task::spawn(send_transaction(
-                        signer,
-                        bcast_resp_sender,
-                        tx_with_internal_nonce,
-                    ));
-                } else {
-                    // TODO return error in oneshot here
-                    // TODO could consider retrying above two loops 2-3 times before giving up
-                }
+                handle_new_tx_with_oneshot(
+                    &provider,
+                    &signers,
+                    &mut signer_states,
+                    tx_with_oneshot,
+                    internal_nonce,
+                    &mut oneshot_responder_map,
+                    &bcast_resp_sender,
+                )
+                .await;
             },
             bcast_resp = bcast_resp_receiver.recv() => {
                 let bcast_resp = bcast_resp.unwrap();
-                let _ = oneshot_responder_map
-                    .remove(&bcast_resp.internal_nonce)
-                    .unwrap()
-                    .send(bcast_resp.broadcast_result);
+                handle_broadcast_response(
+                    &mut signer_states,
+                    bcast_resp,
+                    &mut oneshot_responder_map
+                ).await;
+            }
+        }
+    }
+}
 
-                match signer_states.get(&bcast_resp.signer_address).unwrap() {
-                    Busy { .. } => {
-                        let state = signer_states.get_mut(&bcast_resp.signer_address).unwrap();
-                        if let Busy {
-                            balance,
-                            estimated_pending_spend,
-                            nonces_and_est_costs,
-                        } = state
-                        {
-                            *balance = bcast_resp.new_signer_balance;
-                            let pending_spend_to_remove = nonces_and_est_costs
-                                .remove(&bcast_resp.internal_nonce)
-                                .unwrap();
-                            *estimated_pending_spend -= pending_spend_to_remove;
+type SliceOfSigners = [Arc<SignerMiddleware<Arc<Provider<Http>>, Wallet<SigningKey>>>];
+async fn handle_new_tx_with_oneshot(
+    provider: &Arc<Provider<Http>>,
+    signers: &SliceOfSigners,
+    signer_states: &mut HashMap<H160, SignerState>,
+    tx_with_oneshot: TXWithOneshot,
+    internal_nonce: U256,
+    oneshot_responder_map: &mut HashMap<
+        U256,
+        oneshot::Sender<eyre::Result<Option<TransactionReceipt>>>,
+    >,
+    bcast_resp_sender: &mpsc::Sender<BroadcastResponse>,
+) {
+    use SignerState::*;
 
-                            if nonces_and_est_costs.is_empty() {
-                                *state = Idle { balance: *balance }
-                            }
-                        }
-                    }
-                    _ => panic!("State must have been busy"),
+    let tx_with_internal_nonce = TXWithInternalNonce {
+        function_call: tx_with_oneshot.function_call,
+        internal_nonce,
+    };
+    oneshot_responder_map.insert(internal_nonce, tx_with_oneshot.oneshot_sender);
+
+    // TODO if gas cost estimation fails, just return error in oneshot here
+    let estimated_gas_cost = estimate_gas_cost(provider, &tx_with_internal_nonce.function_call)
+        .await
+        .unwrap();
+
+    // try idle signers first
+    let mut good_signer = signers.iter().find(|s| {
+        if let Some(Idle { balance }) = signer_states.get(&s.address()) {
+            *balance >= estimated_gas_cost
+        } else {
+            false
+        }
+    });
+
+    // if no idle signer worked, try busy signers
+    if good_signer.is_none() {
+        good_signer = signers.iter().find(|s| {
+            if let Some(Busy {
+                balance,
+                estimated_pending_spend,
+                ..
+            }) = signer_states.get(&s.address())
+            {
+                *balance - *estimated_pending_spend >= estimated_gas_cost
+            } else {
+                false
+            }
+        });
+    }
+
+    if let Some(signer) = good_signer {
+        match signer_states.get(&signer.address()).unwrap() {
+            Idle { balance } => {
+                *signer_states.get_mut(&signer.address()).unwrap() = Busy {
+                    balance: *balance,
+                    estimated_pending_spend: estimated_gas_cost,
+                    nonces_and_est_costs: HashMap::from([(
+                        tx_with_internal_nonce.internal_nonce,
+                        estimated_gas_cost,
+                    )]),
+                };
+            }
+            Busy { .. } => {
+                let state = signer_states.get_mut(&signer.address()).unwrap();
+                if let Busy {
+                    estimated_pending_spend,
+                    nonces_and_est_costs,
+                    ..
+                } = state
+                {
+                    *estimated_pending_spend += estimated_gas_cost;
+                    nonces_and_est_costs
+                        .insert(tx_with_internal_nonce.internal_nonce, estimated_gas_cost);
                 }
             }
         }
+        let signer = Arc::clone(signer);
+        let bcast_resp_sender = bcast_resp_sender.clone();
+        task::spawn(send_transaction(
+            signer,
+            bcast_resp_sender,
+            tx_with_internal_nonce,
+        ));
+    } else {
+        // TODO return error in oneshot here
+        // TODO could consider retrying above two loops 2-3 times before giving up
+    }
+}
+
+async fn handle_broadcast_response(
+    signer_states: &mut HashMap<H160, SignerState>,
+    bcast_resp: BroadcastResponse,
+    oneshot_responder_map: &mut HashMap<
+        U256,
+        oneshot::Sender<eyre::Result<Option<TransactionReceipt>>>,
+    >,
+) {
+    use SignerState::*;
+    let _ = oneshot_responder_map
+        .remove(&bcast_resp.internal_nonce)
+        .unwrap()
+        .send(bcast_resp.broadcast_result);
+
+    match signer_states.get(&bcast_resp.signer_address).unwrap() {
+        Busy { .. } => {
+            let state = signer_states.get_mut(&bcast_resp.signer_address).unwrap();
+            if let Busy {
+                balance,
+                estimated_pending_spend,
+                nonces_and_est_costs,
+            } = state
+            {
+                *balance = bcast_resp.new_signer_balance;
+                let pending_spend_to_remove = nonces_and_est_costs
+                    .remove(&bcast_resp.internal_nonce)
+                    .unwrap();
+                *estimated_pending_spend -= pending_spend_to_remove;
+
+                if nonces_and_est_costs.is_empty() {
+                    *state = Idle { balance: *balance }
+                }
+            }
+        }
+        _ => panic!("State must have been busy"),
     }
 }
 
