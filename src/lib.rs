@@ -1,17 +1,25 @@
-use std::{collections::HashMap, panic, sync::Arc};
+use std::{borrow::Borrow, collections::HashMap, panic, sync::Arc};
 
-use ethers::prelude::{k256::ecdsa::SigningKey, *};
+use ethers::{abi::Detokenize, prelude::*};
 use tokio::{
     sync::{mpsc, oneshot},
     task,
 };
 
-pub struct SignerPool {
-    tx_sender: mpsc::Sender<TXWithOneshot>,
+pub struct SignerPool<B, M, D> {
+    tx_sender: mpsc::Sender<TXWithOneshot<B, M, D>>,
 }
 
-impl SignerPool {
-    pub fn new(provider: Arc<Provider<Http>>, signing_keys: Vec<Wallet<SigningKey>>) -> SignerPool {
+impl<B, M, D> SignerPool<B, M, D>
+where
+    B: Borrow<M> + Send + Sync + 'static,
+    M: Middleware + 'static,
+    D: Detokenize + Send + Sync + 'static,
+{
+    pub fn new<S>(provider: Arc<M>, signing_keys: Vec<S>) -> SignerPool<B, M, D>
+    where
+        S: Signer + 'static,
+    {
         // TODO make buffer capacity configurable
         let (tx_sender, tx_receiver) = mpsc::channel(100);
         task::spawn(dispatcher_task(provider, signing_keys, tx_receiver));
@@ -20,7 +28,7 @@ impl SignerPool {
 
     pub async fn send_transactions(
         &self,
-        function_calls: Vec<FunctionCall<Arc<Provider<Http>>, Provider<Http>, ()>>,
+        function_calls: Vec<FunctionCall<B, M, D>>,
     ) -> Vec<eyre::Result<Option<TransactionReceipt>>> {
         // TODO allow caller to specify optional gas fetching function
         // TODO allow caller to specify optional gas cost estimation function
@@ -49,11 +57,16 @@ impl SignerPool {
     }
 }
 
-async fn dispatcher_task(
-    provider: Arc<Provider<Http>>,
-    signing_keys: Vec<Wallet<SigningKey>>,
-    mut tx_receiver: mpsc::Receiver<TXWithOneshot>,
-) {
+async fn dispatcher_task<B, M, D, S>(
+    provider: Arc<M>,
+    signing_keys: Vec<S>,
+    mut tx_receiver: mpsc::Receiver<TXWithOneshot<B, M, D>>,
+) where
+    B: Borrow<M> + Send + Sync + 'static,
+    M: Middleware + 'static,
+    D: Detokenize + Send + Sync + 'static,
+    S: Signer + 'static,
+{
     let mut signers = vec![];
     let mut signer_states = HashMap::new();
     for k in signing_keys {
@@ -100,19 +113,23 @@ async fn dispatcher_task(
     }
 }
 
-type SignerMW = Arc<SignerMiddleware<Arc<Provider<Http>>, Wallet<SigningKey>>>;
-async fn handle_new_tx_with_oneshot(
-    provider: &Arc<Provider<Http>>,
-    signers: &[SignerMW],
+async fn handle_new_tx_with_oneshot<B, M, D, S>(
+    provider: &Arc<M>,
+    signers: &[Arc<SignerMiddleware<Arc<M>, S>>],
     signer_states: &mut HashMap<H160, SignerState>,
-    tx_with_oneshot: TXWithOneshot,
+    tx_with_oneshot: TXWithOneshot<B, M, D>,
     internal_nonce: U256,
     oneshot_responder_map: &mut HashMap<
         U256,
         oneshot::Sender<eyre::Result<Option<TransactionReceipt>>>,
     >,
     bcast_resp_sender: &mpsc::Sender<BroadcastResponse>,
-) {
+) where
+    B: Borrow<M> + Send + Sync + 'static,
+    M: Middleware + 'static,
+    D: Detokenize + Send + Sync + 'static,
+    S: Signer + 'static,
+{
     let tx_with_internal_nonce = TXWithInternalNonce {
         function_call: tx_with_oneshot.function_call,
         internal_nonce,
@@ -120,9 +137,10 @@ async fn handle_new_tx_with_oneshot(
     oneshot_responder_map.insert(internal_nonce, tx_with_oneshot.oneshot_sender);
 
     // TODO if gas cost estimation fails, just return error in oneshot here
-    let estimated_gas_cost = estimate_gas_cost(provider, &tx_with_internal_nonce.function_call)
-        .await
-        .unwrap();
+    let estimated_gas_cost =
+        estimate_gas_cost(provider.as_ref(), &tx_with_internal_nonce.function_call)
+            .await
+            .unwrap();
     let good_signer = get_good_signer(signers, signer_states, estimated_gas_cost);
 
     if let Some(signer) = good_signer {
@@ -145,11 +163,15 @@ async fn handle_new_tx_with_oneshot(
     }
 }
 
-fn get_good_signer<'a>(
-    signers: &'a [SignerMW],
+fn get_good_signer<'a, M, S>(
+    signers: &'a [Arc<SignerMiddleware<Arc<M>, S>>],
     signer_states: &HashMap<H160, SignerState>,
     estimated_gas_cost: U256,
-) -> Option<&'a SignerMW> {
+) -> Option<&'a Arc<SignerMiddleware<Arc<M>, S>>>
+where
+    M: Middleware,
+    S: Signer,
+{
     use SignerState::*;
 
     // try idle signers first
@@ -207,21 +229,31 @@ async fn handle_broadcast_response(
     );
 }
 
-async fn estimate_gas_cost(
-    provider: &Provider<Http>,
-    function_call: &FunctionCall<Arc<Provider<Http>>, Provider<Http>, ()>,
-) -> eyre::Result<U256> {
+async fn estimate_gas_cost<B, M, D>(
+    provider: &M,
+    function_call: &FunctionCall<B, M, D>,
+) -> eyre::Result<U256>
+where
+    B: Borrow<M>,
+    M: Middleware + 'static,
+    D: Detokenize,
+{
     // TODO custom errors + gas scaling (configurable?)
     let gas_price = provider.get_gas_price().await?;
     let gas_units = function_call.estimate_gas().await?;
     Ok(gas_price * gas_units)
 }
 
-async fn send_transaction(
-    signer: Arc<SignerMiddleware<Arc<Provider<Http>>, Wallet<SigningKey>>>,
+async fn send_transaction<B, M, D, S>(
+    signer: Arc<SignerMiddleware<Arc<M>, S>>,
     bcast_resp_sender: mpsc::Sender<BroadcastResponse>,
-    tx_with_internal_nonce: TXWithInternalNonce,
-) {
+    tx_with_internal_nonce: TXWithInternalNonce<B, M, D>,
+) where
+    B: Borrow<M>,
+    M: Middleware,
+    D: Detokenize,
+    S: Signer,
+{
     let mut tx = tx_with_internal_nonce.function_call.tx.clone();
     // TODO custom errors + gas scaling (configurable?)
     tx.set_gas_price(signer.get_gas_price().await.unwrap());
@@ -253,16 +285,16 @@ async fn send_transaction(
         .await;
 }
 
-struct TXWithOneshot {
+struct TXWithOneshot<B, M, D> {
     // TODO see if we can get away with borrowing function_call
-    function_call: FunctionCall<Arc<Provider<Http>>, Provider<Http>, ()>,
+    function_call: FunctionCall<B, M, D>,
     // TODO custom error messages for different kinds of failures
     oneshot_sender: oneshot::Sender<eyre::Result<Option<TransactionReceipt>>>,
 }
 
-struct TXWithInternalNonce {
+struct TXWithInternalNonce<B, M, D> {
     // TODO see if we can get away with borrowing function_call
-    function_call: FunctionCall<Arc<Provider<Http>>, Provider<Http>, ()>,
+    function_call: FunctionCall<B, M, D>,
     internal_nonce: U256,
 }
 
