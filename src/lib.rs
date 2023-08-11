@@ -100,10 +100,10 @@ async fn dispatcher_task(
     }
 }
 
-type SliceOfSigners = [Arc<SignerMiddleware<Arc<Provider<Http>>, Wallet<SigningKey>>>];
+type SignerMW = Arc<SignerMiddleware<Arc<Provider<Http>>, Wallet<SigningKey>>>;
 async fn handle_new_tx_with_oneshot(
     provider: &Arc<Provider<Http>>,
-    signers: &SliceOfSigners,
+    signers: &[SignerMW],
     signer_states: &mut HashMap<H160, SignerState>,
     tx_with_oneshot: TXWithOneshot,
     internal_nonce: U256,
@@ -125,31 +125,7 @@ async fn handle_new_tx_with_oneshot(
     let estimated_gas_cost = estimate_gas_cost(provider, &tx_with_internal_nonce.function_call)
         .await
         .unwrap();
-
-    // try idle signers first
-    let mut good_signer = signers.iter().find(|s| {
-        if let Some(Idle { balance }) = signer_states.get(&s.address()) {
-            *balance >= estimated_gas_cost
-        } else {
-            false
-        }
-    });
-
-    // if no idle signer worked, try busy signers
-    if good_signer.is_none() {
-        good_signer = signers.iter().find(|s| {
-            if let Some(Busy {
-                balance,
-                estimated_pending_spend,
-                ..
-            }) = signer_states.get(&s.address())
-            {
-                *balance - *estimated_pending_spend >= estimated_gas_cost
-            } else {
-                false
-            }
-        });
-    }
+    let good_signer = get_good_signer(signers, signer_states, estimated_gas_cost);
 
     if let Some(signer) = good_signer {
         match signer_states.get(&signer.address()).unwrap() {
@@ -188,6 +164,41 @@ async fn handle_new_tx_with_oneshot(
         // TODO return error in oneshot here
         // TODO could consider retrying above two loops 2-3 times before giving up
     }
+}
+
+fn get_good_signer<'a>(
+    signers: &'a [SignerMW],
+    signer_states: &HashMap<H160, SignerState>,
+    estimated_gas_cost: U256,
+) -> Option<&'a SignerMW> {
+    use SignerState::*;
+
+    // try idle signers first
+    let mut good_signer = signers.iter().find(|s| {
+        if let Some(Idle { balance }) = signer_states.get(&s.address()) {
+            *balance >= estimated_gas_cost
+        } else {
+            false
+        }
+    });
+
+    // if no idle signer worked, try busy signers
+    if good_signer.is_none() {
+        good_signer = signers.iter().find(|s| {
+            if let Some(Busy {
+                balance,
+                estimated_pending_spend,
+                ..
+            }) = signer_states.get(&s.address())
+            {
+                *balance - *estimated_pending_spend >= estimated_gas_cost
+            } else {
+                false
+            }
+        });
+    }
+
+    good_signer
 }
 
 async fn handle_broadcast_response(
