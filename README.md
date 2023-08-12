@@ -1,8 +1,6 @@
 # ethers-signer-pool
 This library provides a utility built on top of the [ethers](https://github.com/gakonst/ethers-rs) crate. The purpose of the utility is to provide a pool of signers (wallets) that can process an arbitrary number of transactions concurrently. As such, a user of this library only needs to instantiate a `SignerPool` once with a middleware (provider), as well as a list of signing keys. From that point on, the user can simply interface with the library by passing in a list of function calls that encapsulate the transactions that the user would like executed, and the signer pool will _schedule_ each transaction on an appropriate signer. Transaction broadcast and confirmation is done in a new task so as to introduce concurrency where it matters most.
 
-TODO: add example code with usage
-
 ## High-level architecture
 
 The `SignerPool` can be broken down into 4 parts: the API, the dispatcher task, the signers, and the futures/tasks used for broadcasting and confirmations.
@@ -20,3 +18,9 @@ The `SignerPool` can be broken down into 4 parts: the API, the dispatcher task, 
   - It updates the particular signer's balance and updates its state (makes it _less busy_ or idle)
   - It finds the oneshot sender corresponding to the particular TX and sends the result/error down
 
+## TODOs
+
+- Add example code with usage to top of README
+- Introduce custom errors and resolve TODOs marked in code related to error handling
+- Add unit tests for signer and dispatcher modules, along with some integration tests
+- Add in-code documentation to prepare crate for publishing
