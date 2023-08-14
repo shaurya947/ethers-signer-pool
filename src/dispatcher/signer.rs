@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 
 use super::{BroadcastResponse, TXWithInternalNonce};
 
+#[derive(Debug, PartialEq)]
 pub(super) enum SignerState {
     Idle {
         balance: U256,
@@ -150,4 +151,122 @@ pub(super) async fn send_transaction<B, M, D, S>(
             signer_address: signer.address(),
         })
         .await;
+}
+
+#[cfg(test)]
+mod signer_state_tests {
+    use std::collections::HashMap;
+
+    use ethers::{types::U256, utils::parse_ether};
+
+    use super::SignerState::*;
+
+    #[test]
+    fn state_idle_add_to_pending_spend() {
+        let state = Idle {
+            balance: parse_ether("4.2").unwrap(),
+        };
+
+        let state = state.add_to_pending_spend(parse_ether("0.7").unwrap(), U256::from(2));
+        assert_eq!(
+            state,
+            Busy {
+                balance: parse_ether("4.2").unwrap(),
+                estimated_pending_spend: parse_ether("0.7").unwrap(),
+                nonces_and_est_costs: HashMap::from([(U256::from(2), parse_ether("0.7").unwrap())])
+            }
+        );
+    }
+
+    #[test]
+    fn state_busy_add_to_pending_spend() {
+        let state = Busy {
+            balance: parse_ether("4.2").unwrap(),
+            estimated_pending_spend: parse_ether("1.5").unwrap(),
+            nonces_and_est_costs: HashMap::from([
+                (U256::from(2), parse_ether("0.7").unwrap()),
+                (U256::from(5), parse_ether("0.8").unwrap()),
+            ]),
+        };
+
+        let state = state.add_to_pending_spend(parse_ether("0.2").unwrap(), U256::from(6));
+        assert_eq!(
+            state,
+            Busy {
+                balance: parse_ether("4.2").unwrap(),
+                estimated_pending_spend: parse_ether("1.7").unwrap(),
+                nonces_and_est_costs: HashMap::from([
+                    (U256::from(2), parse_ether("0.7").unwrap()),
+                    (U256::from(5), parse_ether("0.8").unwrap()),
+                    (U256::from(6), parse_ether("0.2").unwrap()),
+                ]),
+            }
+        );
+    }
+
+    #[test]
+    #[should_panic = "Invalid signer state"]
+    fn state_idle_remove_from_pending_spend() {
+        let state = Idle {
+            balance: parse_ether("4.2").unwrap(),
+        };
+
+        let _ = state.remove_from_pending_spend(parse_ether("0.7").unwrap(), U256::from(2));
+    }
+
+    #[test]
+    #[should_panic]
+    fn state_busy_remove_from_pending_spend_invalid_nonce() {
+        let state = Busy {
+            balance: parse_ether("4.2").unwrap(),
+            estimated_pending_spend: parse_ether("1.5").unwrap(),
+            nonces_and_est_costs: HashMap::from([
+                (U256::from(2), parse_ether("0.7").unwrap()),
+                (U256::from(5), parse_ether("0.8").unwrap()),
+            ]),
+        };
+
+        let _ = state.remove_from_pending_spend(parse_ether("3.5").unwrap(), U256::from(6));
+    }
+
+    #[test]
+    fn state_busy_remove_from_pending_spend_to_idle() {
+        let state = Busy {
+            balance: parse_ether("4.2").unwrap(),
+            estimated_pending_spend: parse_ether("0.7").unwrap(),
+            nonces_and_est_costs: HashMap::from([(U256::from(2), parse_ether("0.7").unwrap())]),
+        };
+
+        let state = state.remove_from_pending_spend(parse_ether("3.48").unwrap(), U256::from(2));
+        assert_eq!(
+            state,
+            Idle {
+                balance: parse_ether("3.48").unwrap()
+            }
+        );
+    }
+
+    #[test]
+    fn state_busy_remove_from_pending_spend_still_busy() {
+        let state = Busy {
+            balance: parse_ether("4.2").unwrap(),
+            estimated_pending_spend: parse_ether("1.5").unwrap(),
+            nonces_and_est_costs: HashMap::from([
+                (U256::from(2), parse_ether("0.7").unwrap()),
+                (U256::from(5), parse_ether("0.8").unwrap()),
+            ]),
+        };
+
+        let state = state.remove_from_pending_spend(parse_ether("3.48").unwrap(), U256::from(2));
+        assert_eq!(
+            state,
+            Busy {
+                balance: parse_ether("3.48").unwrap(),
+                estimated_pending_spend: parse_ether("0.8").unwrap(),
+                nonces_and_est_costs: HashMap::from(
+                    [(U256::from(5), parse_ether("0.8").unwrap()),]
+                )
+            }
+        );
+    }
 }
