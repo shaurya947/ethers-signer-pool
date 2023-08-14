@@ -270,3 +270,174 @@ mod signer_state_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod get_good_signer_tests {
+    use std::{collections::HashMap, sync::Arc};
+
+    use ethers::{
+        prelude::{rand::thread_rng, SignerMiddleware},
+        providers::Provider,
+        signers::Wallet,
+        types::U256,
+        utils::parse_ether,
+    };
+
+    use crate::dispatcher::signer::get_good_signer;
+
+    use super::SignerState::*;
+
+    #[test]
+    fn good_idle_signer_exists() {
+        let (provider, _) = Provider::mocked();
+        let provider = Arc::new(provider);
+        let estimated_gas_cost = parse_ether("0.24").unwrap();
+        let mut rng = thread_rng();
+        let signing_keys = vec![
+            Wallet::new(&mut rng),
+            Wallet::new(&mut rng),
+            Wallet::new(&mut rng),
+        ];
+
+        // 3 signers
+        let signers = signing_keys
+            .into_iter()
+            .map(|k| Arc::new(SignerMiddleware::new(Arc::clone(&provider), k)))
+            .collect::<Vec<_>>();
+
+        // 1st is busy but good, 2nd is idle and good, 3rd is idle and not good
+        let signer_states = HashMap::from([
+            (
+                signers[0].address(),
+                Busy {
+                    balance: parse_ether("2.8").unwrap(),
+                    estimated_pending_spend: parse_ether("0.7").unwrap(),
+                    nonces_and_est_costs: HashMap::from([(
+                        U256::from(2),
+                        parse_ether("0.7").unwrap(),
+                    )]),
+                },
+            ),
+            (
+                signers[1].address(),
+                Idle {
+                    balance: parse_ether("4.2").unwrap(),
+                },
+            ),
+            (
+                signers[2].address(),
+                Idle {
+                    balance: parse_ether("0.15").unwrap(),
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            get_good_signer(&signers, &signer_states, estimated_gas_cost)
+                .unwrap()
+                .address(),
+            signers[1].address()
+        );
+    }
+
+    #[test]
+    fn good_busy_signer_exists() {
+        let (provider, _) = Provider::mocked();
+        let provider = Arc::new(provider);
+        let estimated_gas_cost = parse_ether("0.24").unwrap();
+        let mut rng = thread_rng();
+        let signing_keys = vec![
+            Wallet::new(&mut rng),
+            Wallet::new(&mut rng),
+            Wallet::new(&mut rng),
+        ];
+
+        // 3 signers
+        let signers = signing_keys
+            .into_iter()
+            .map(|k| Arc::new(SignerMiddleware::new(Arc::clone(&provider), k)))
+            .collect::<Vec<_>>();
+
+        // 1st is busy but good, 2nd is idle and not good, 3rd is idle and not good
+        let signer_states = HashMap::from([
+            (
+                signers[0].address(),
+                Busy {
+                    balance: parse_ether("2.8").unwrap(),
+                    estimated_pending_spend: parse_ether("0.7").unwrap(),
+                    nonces_and_est_costs: HashMap::from([(
+                        U256::from(2),
+                        parse_ether("0.7").unwrap(),
+                    )]),
+                },
+            ),
+            (
+                signers[1].address(),
+                Idle {
+                    balance: parse_ether("0.2").unwrap(),
+                },
+            ),
+            (
+                signers[2].address(),
+                Idle {
+                    balance: parse_ether("0.15").unwrap(),
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            get_good_signer(&signers, &signer_states, estimated_gas_cost)
+                .unwrap()
+                .address(),
+            signers[0].address()
+        );
+    }
+
+    #[test]
+    fn no_good_signer_exists() {
+        let (provider, _) = Provider::mocked();
+        let provider = Arc::new(provider);
+        let estimated_gas_cost = parse_ether("0.24").unwrap();
+        let mut rng = thread_rng();
+        let signing_keys = vec![
+            Wallet::new(&mut rng),
+            Wallet::new(&mut rng),
+            Wallet::new(&mut rng),
+        ];
+
+        // 3 signers
+        let signers = signing_keys
+            .into_iter()
+            .map(|k| Arc::new(SignerMiddleware::new(Arc::clone(&provider), k)))
+            .collect::<Vec<_>>();
+
+        // 1st is busy but not good, 2nd is idle and not good, 3rd is idle and not good
+        let signer_states = HashMap::from([
+            (
+                signers[0].address(),
+                Busy {
+                    balance: parse_ether("0.18").unwrap(),
+                    estimated_pending_spend: parse_ether("0.07").unwrap(),
+                    nonces_and_est_costs: HashMap::from([(
+                        U256::from(2),
+                        parse_ether("0.07").unwrap(),
+                    )]),
+                },
+            ),
+            (
+                signers[1].address(),
+                Idle {
+                    balance: parse_ether("0.2").unwrap(),
+                },
+            ),
+            (
+                signers[2].address(),
+                Idle {
+                    balance: parse_ether("0.15").unwrap(),
+                },
+            ),
+        ]);
+
+        assert!(get_good_signer(&signers, &signer_states, estimated_gas_cost).is_none());
+    }
+}
